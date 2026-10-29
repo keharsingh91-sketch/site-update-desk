@@ -15,7 +15,7 @@ import streamlit as st
 from anthropic import Anthropic
 from PIL import Image
 
-st.set_page_config(page_title="Site update desk", page_icon="📡", layout="wide")
+st.set_page_config(page_title="Site update desk", page_icon="📡", layout="wide", initial_sidebar_state="collapsed")
 
 # ---------------------------------------------------------------- defaults
 EX = """13674 ENNISKILLEN MF(COL.MOD.UK.0009238) BUILD Day 02 : Team attended the site and continued work. Correct square bolts were delivered. 3 x antennas were swapped out. 2 new poles were installed along with bob ers’s and earth bars. Team confirmed that they had intermittent weather, which had slowed them down.
@@ -319,6 +319,81 @@ def basic_pend(msgs, days):
     summary = f"Covered {len(days)} day(s) from {fmt(days[0])} to {fmt(days[-1])}. {len(items)} item(s) were raised: {len(items) - len(still)} resolved, {len(still)} still pending."
     return {"items": items, "siteClosed": closed, "closedOn": fmt(days[-1]) if closed else "", "summary": summary}
 
+
+# ---------------------------------------------------------------- look and feel for management
+CSS = """<style>
+#MainMenu, footer {visibility:hidden}
+[data-testid="stToolbar"] {visibility:hidden}
+.block-container {padding-top:1.4rem; max-width:1180px}
+.hero{display:flex;gap:16px;align-items:center;padding:22px 24px;border-radius:18px;background:linear-gradient(135deg,#0b5cad,#082f5c);color:#fff;box-shadow:0 10px 30px rgba(8,47,92,.25);margin-bottom:18px}
+.hero .badge{font-size:30px;width:56px;height:56px;border-radius:14px;background:rgba(255,255,255,.16);display:grid;place-items:center;flex:none}
+.hero h1{font-size:28px;margin:0 0 4px;color:#fff;padding:0}
+.hero p{margin:0;color:rgba(255,255,255,.88)}
+.hero .steps{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.hero .steps span{background:rgba(255,255,255,.16);border-radius:999px;padding:3px 12px;font-size:13px}
+[data-testid="stMetric"]{background:var(--secondary-background-color);border:1px solid rgba(128,128,128,.25);border-radius:14px;padding:12px 16px}
+</style>"""
+
+
+def hero():
+    title = secret("APP_TITLE", "Site Update Desk")
+    company = secret("COMPANY_NAME", "")
+    sub = f"{company} · " if company else ""
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="hero"><div class="badge">📡</div><div><h1>{title}</h1>'
+        f"<p>{sub}Daily site updates, management report and client summary from WhatsApp site chats.</p>"
+        '<div class="steps"><span>1 Upload chats</span><span>2 Pick date and sites</span><span>3 Copy or download the report</span></div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def style_status(df, col="Status"):
+    if df.empty or col not in df:
+        return df
+
+    def colour(v):
+        v = str(v).lower()
+        if v.startswith(("on-air", "completed", "resolved", "closed")):
+            return "background-color:#d9f2e3;color:#14532d"
+        if v.startswith(("issue", "error")):
+            return "background-color:#fde2e0;color:#7a1712"
+        if v.startswith(("pending", "still", "in progress")):
+            return "background-color:#fdf0d5;color:#7a4a00"
+        return ""
+
+    sty = df.style
+    return (getattr(sty, "map", None) or sty.applymap)(colour, subset=[col])
+
+
+def kpis_daily(table):
+    nil = lambda v: str(v).strip().lower() in ("nil", "", "none")
+    return [
+        ("Sites reported", len(table)),
+        ("On-Air / Completed", sum(1 for r in table if r["Status"] in ("On-Air", "Completed"))),
+        ("With pending items", sum(1 for r in table if not nil(r["Pending"]))),
+        ("With issues", sum(1 for r in table if not nil(r["Issues / Errors"]))),
+    ]
+
+
+def kpis_pend(table):
+    still = sum(1 for r in table if str(r["Status"]).lower().startswith("still"))
+    return [("Sites tracked", len({r["Site"] for r in table})), ("Items raised", len(table)), ("Resolved", len(table) - still), ("Still pending", still)]
+
+
+def report_html(title, subtitle, kpis, df, body):
+    import html
+    k = "".join(f'<div class="k"><b>{v}</b><span>{html.escape(l)}</span></div>' for l, v in kpis)
+    rows = df.to_html(index=False, escape=True, border=0, classes="t")
+    css = ("body{font-family:Segoe UI,Arial,sans-serif;color:#16202a;max-width:920px;margin:30px auto;padding:0 20px}h1{font-size:22px;margin:0}"
+           ".sub{color:#5d6b78;margin:4px 0 18px}.ks{display:flex;gap:12px;margin:16px 0}.k{flex:1;border:1px solid #d6dde4;border-radius:10px;padding:10px 14px}"
+           ".k b{display:block;font-size:24px}.k span{color:#5d6b78;font-size:12px}table.t{border-collapse:collapse;width:100%;font-size:13px}"
+           ".t th,.t td{border:1px solid #d6dde4;padding:6px 8px;text-align:left;vertical-align:top}.t th{background:#eaeff4}"
+           "pre{white-space:pre-wrap;font:14px/1.5 Segoe UI,Arial,sans-serif;background:#f4f6f8;padding:14px;border-radius:8px}")
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title><style>{css}</style></head><body>'
+            f'<h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div><div class="ks">{k}</div>{rows}'
+            f'<h2 style="font-size:15px;margin-top:24px">Email</h2><pre>{html.escape(body)}</pre></body></html>')
+
 # ---------------------------------------------------------------- app
 def gate():
     code = secret("APP_PASSWORD")
@@ -326,7 +401,7 @@ def gate():
         return
     if st.session_state.get("ok"):
         return
-    st.title("📡 Site update desk")
+    hero()
     v = st.text_input("Access code", type="password")
     if v and v == code:
         st.session_state["ok"] = True
@@ -338,13 +413,12 @@ def gate():
 
 def main():
     gate()
-    st.title("📡 Site update desk")
-    st.caption("Upload WhatsApp site chats (with photos) and related emails. Get the daily site email, management report and client summary.")
+    hero()
 
     api_key = secret("ANTHROPIC_API_KEY")
     client = Anthropic(api_key=api_key) if api_key else None
     if not client:
-        st.info("Basic mode (no AI key): chats are sorted with keywords and written as they appear. Photos, emails and smart rewriting are switched off. Add ANTHROPIC_API_KEY in the app secrets to turn them on.")
+        st.caption("Basic mode (no AI key): chats are sorted with keywords and written as they appear. Photos, emails and smart rewriting are switched off. Add ANTHROPIC_API_KEY in the app secrets to turn them on.")
     model = secret("MODEL", "claude-sonnet-5-5")
 
     # ---- sidebar settings
@@ -511,8 +585,14 @@ def show(out):
                 st.code(body, language=None)
             st.markdown(f"**Management report – {fmt(d)}**")
             df = pd.DataFrame(blk["table"])
-            st.dataframe(df, width="stretch", hide_index=True)
-            st.download_button("Download table (.csv)", df.to_csv(index=False), file_name=f"report-{d}.csv", key=f"csv_{n}_{d}")
+            kp = kpis_daily(blk["table"])
+            for c, (k, v) in zip(st.columns(4), kp):
+                c.metric(k, v)
+            st.dataframe(style_status(df), width="stretch", hide_index=True)
+            x1, x2 = st.columns(2)
+            x1.download_button("Download table (.csv)", df.to_csv(index=False), file_name=f"report-{d}.csv", key=f"csv_{n}_{d}")
+            x2.download_button("Download management report (HTML)", report_html(secret("APP_TITLE", "Site Update Desk"), f"{secret('COMPANY_NAME', '')} Daily site update – {fmt(d)}".strip(), kp, df, body),
+                               file_name=f"site-report-{d}.html", mime="text/html", key=f"html_{n}_{d}")
     else:
         st.subheader(f"Client summary – {out['rng']}")
         st.text_input("Subject", f"Pending Items Summary – {out['rng']}", key=f"psub_{n}")
@@ -523,8 +603,14 @@ def show(out):
         title = st.text_input("Table title", "Pending tracker", key="ptitle")
         st.markdown(f"**{title}**")
         df = pd.DataFrame(out["table"])
-        st.dataframe(df, width="stretch", hide_index=True)
-        st.download_button("Download table (.csv)", df.to_csv(index=False), file_name="pending-tracker.csv", key=f"pcsv_{n}")
+        kp = kpis_pend(out["table"])
+        for c, (k, v) in zip(st.columns(4), kp):
+            c.metric(k, v)
+        st.dataframe(style_status(df), width="stretch", hide_index=True)
+        x1, x2 = st.columns(2)
+        x1.download_button("Download table (.csv)", df.to_csv(index=False), file_name="pending-tracker.csv", key=f"pcsv_{n}")
+        x2.download_button("Download management report (HTML)", report_html(secret("APP_TITLE", "Site Update Desk"), f"{secret('COMPANY_NAME', '')} Client summary – {out['rng']}".strip(), kp, df, body),
+                           file_name="client-summary-report.html", mime="text/html", key=f"phtml_{n}")
 
 
 if __name__ == "__main__":
