@@ -266,6 +266,59 @@ def pend_prompt(site, days_text, mails, d0, d1, o):
     ])
 
 
+
+# ---------------------------------------------------------------- basic mode (no AI key)
+ISSUE_RE = re.compile(r"\b(issues?|errors?|fail(ed|ure|s)?|faults?|faulty|shortages?|delay(ed)?|blocked|not working|rejected|denied|no access|missing|damaged|wrong|mismatch|rolled? ?back|escalat\w+|unable|cannot|can.?t)\b", re.I)
+NEG_RE = re.compile(r"\b(no|nil|zero|without|resolved|cleared|fixed)\b.{0,20}\b(issues?|errors?|fail\w*|faults?|alarms?|shortages?|delay\w*)", re.I)
+PEND_RE = re.compile(r"\b(pending|awaiting|await(ed)?|waiting|to be (done|completed|shared|raised|checked)|tomorrow|yet to|required|needs?|needed|follow.?up|reschedul\w+|on hold|will be|returning)\b", re.I)
+NOISE_RE = re.compile(r"^(ok(ay)?|thanks?( you)?|noted|ack|received|done)\W*$", re.I)
+
+
+def classify(lines):
+    done, pend, iss = [], [], []
+    for line in lines:
+        for s in re.split(r"(?<=[.!?])\s+", line):
+            s = s.strip()
+            if len(s) < 4 or NOISE_RE.match(s):
+                continue
+            s = s[0].upper() + s[1:]
+            s = s if re.search(r"[.!?]$", s) else s + "."
+            bad = ISSUE_RE.search(s) and not NEG_RE.search(s)
+            target = iss if bad else pend if PEND_RE.search(s) else done
+            if s not in target:
+                target.append(s)
+    return done, pend, iss
+
+
+def basic_day(lines, o):
+    done, pend, iss = classify(lines)
+    d = " ".join(done)
+    status = "No update" if not lines else "Issue" if iss else "On-Air" if (re.search(r"\bon[- ]?air\b", d, re.I) and not pend) else "Pending" if pend else "In progress"
+    extra = iss + pend
+    if o["bullets"] == "Always bullets":
+        para = "\n".join("• " + x for x in done + extra)
+    elif o["bullets"].startswith("Auto") and len(extra) >= 3:
+        para = d + "\n" + "\n".join("• " + x for x in extra)
+    else:
+        para = d + ("\n\n" + " ".join(extra) if extra else "")
+    return {"paragraph": para.strip() or "No update received for the day.", "status": status, "pending": " ".join(pend) or "Nil", "issues": " ".join(iss) or "Nil"}
+
+
+def basic_pend(msgs, days):
+    per = [(d,) + classify(day_data(msgs, d)[2]) for d in days]
+    items = []
+    for i, (d, _done, pend, iss) in enumerate(per):
+        for text, is_issue in [(p, False) for p in pend] + [(x, True) for x in iss]:
+            w1 = set(re.findall(r"[a-z0-9]{4,}", text.lower()))
+            res = next((d2 for d2, done2, _p, _i in per[i + 1:] if any(len(w1 & set(re.findall(r"[a-z0-9]{4,}", x.lower()))) >= 2 for x in done2)), None)
+            items.append({"item": text.rstrip("."), "firstRaised": fmt(d), "status": "Resolved" if res else "Still pending", "resolvedOn": fmt(res) if res else "",
+                          "reason": "Issue reported in the chat" if is_issue else "Reason not stated in the chat", "nextAction": ""})
+    still = [x for x in items if x["status"] != "Resolved"]
+    last = " ".join(per[-1][1])
+    closed = bool(re.search(r"hand(ed)? ?over|\bon[- ]?air\b|site closed|build (was )?completed|all works (have been )?(done|completed)", last, re.I)) and not still
+    summary = f"Covered {len(days)} day(s) from {fmt(days[0])} to {fmt(days[-1])}. {len(items)} item(s) were raised: {len(items) - len(still)} resolved, {len(still)} still pending."
+    return {"items": items, "siteClosed": closed, "closedOn": fmt(days[-1]) if closed else "", "summary": summary}
+
 # ---------------------------------------------------------------- app
 def gate():
     code = secret("APP_PASSWORD")
@@ -289,10 +342,9 @@ def main():
     st.caption("Upload WhatsApp site chats (with photos) and related emails. Get the daily site email, management report and client summary.")
 
     api_key = secret("ANTHROPIC_API_KEY")
-    if not api_key:
-        st.error("ANTHROPIC_API_KEY is missing in the app secrets. See the setup steps.")
-        st.stop()
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(api_key=api_key) if api_key else None
+    if not client:
+        st.info("Basic mode (no AI key): chats are sorted with keywords and written as they appear. Photos, emails and smart rewriting are switched off. Add ANTHROPIC_API_KEY in the app secrets to turn them on.")
     model = secret("MODEL", "claude-sonnet-5-5")
 
     # ---- sidebar settings
@@ -381,11 +433,11 @@ def main():
             for i, (s, d) in enumerate(jobs):
                 bar.progress(i / len(jobs), text=f"Working on {s['name']} · {fmt(d)} ({i + 1} of {len(jobs)})")
                 imgs, auds, lines = day_data(s["msgs"], d)
-                photos = load_photos(s["data"], imgs) if s["is_zip"] else []
+                photos = load_photos(s["data"], imgs) if (s["is_zip"] and client) else []
                 prompt = day_prompt(s["name"], s["stage"] if len(dts) == 1 else "", d, [clean(x, banned, rm_phone) for x in lines],
                                     mail_block(mails_for(s["name"], mails, d, same_day_mail), banned, rm_phone), clean(s["voice"], banned, rm_phone), len(photos), opts)
                 try:
-                    r = ask(client, model, prompt, photos)
+                    r = ask(client, model, prompt, photos) if client else basic_day([clean(x, banned, rm_phone) for x in lines], opts)
                 except Exception as e:  # keep going with the other sites
                     r = {"paragraph": f"[Could not create this site: {e}]", "status": "Error", "pending": "", "issues": ""}
                 res.setdefault(d, []).append((s, r))
@@ -415,7 +467,7 @@ def main():
             days_text = "\n\n".join(f"{fmt(d)}:\n" + ("\n".join(clean(x, banned, rm_phone) for x in day_data(s["msgs"], d)[2])[:cap] or "(no messages)") for d in days)
             prompt = pend_prompt(s["name"], days_text, mail_block(mails_for(s["name"], mails, None, False), banned, rm_phone, 2000), days[0], days[-1], opts)
             try:
-                r = ask(client, model, prompt, None, 4000)
+                r = ask(client, model, prompt, None, 4000) if client else basic_pend(s["msgs"], days)
             except Exception as e:
                 r = {"items": [], "siteClosed": False, "summary": f"[Could not create this site: {e}]"}
             res.append((s, r, days[0], days[-1]))
