@@ -128,7 +128,7 @@ def clean(t, banned, rm_phone=True):
 
 
 def site_name(filename):
-    n = re.sub(r"\.(txt|zip)$", "", filename, flags=re.I)
+    n = re.sub(r"\.(txt|zip|eml|csv|xlsx?)$", "", filename, flags=re.I)
     n = re.sub(r"^WhatsApp Chat (with|-)\s*", "", n, flags=re.I)
     return re.sub(r"\s*\(\d+\)$", "", n).strip()
 
@@ -202,16 +202,45 @@ def tokens(name):
     return [x.lower() for x in t]
 
 
-def mails_for(name, mails, d=None, same_day=True):
+def mails_for(name, entries, d=None, same_day=True, lone=False, alt=""):
+    """Entries (emails or Nemo data) that belong to this site: explicit site name, site ID found in the text, or the only site."""
     tk = tokens(name)
+    names = {name.lower(), (alt or "").lower()} - {""}
     out = []
-    for m in mails:
-        if not any(t in (m["subject"] + " " + m["text"]).lower() for t in tk):
+    for m in entries:
+        if m.get("site"):
+            hit = m["site"].lower() in names
+        else:
+            hit = lone or any(t in (m["subject"] + " " + m["text"]).lower() for t in tk)
+        if not hit:
             continue
         if d and same_day and m["date"] and m["date"] != d:
             continue
         out.append(m)
     return out[:5]
+
+
+def parse_nemo(data: bytes, name: str):
+    low = name.lower()
+    try:
+        if low.endswith((".xlsx", ".xls")):
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, dtype=str)
+            text = "\n\n".join(f"Sheet: {k}\n" + v.fillna("").to_csv(index=False) for k, v in sheets.items())
+        elif low.endswith(".csv"):
+            text = pd.read_csv(io.BytesIO(data), dtype=str).fillna("").to_csv(index=False)
+        else:
+            text = data.decode("utf-8", "ignore")
+    except Exception:
+        text = data.decode("utf-8", "ignore")
+    return {"subject": name, "fname": name, "date": None, "text": text.strip(), "site": None}
+
+
+def nemo_block(ms, banned, rm_phone, cap=6000):
+    return "\n---\n".join(f"Source: {clean(m['subject'], banned, rm_phone)}\n" + clean(m["text"], banned, rm_phone)[:cap] for m in ms) or "(none)"
+
+
+def nemo_lines(ms):
+    return [l.strip() for m in ms for l in m["text"].splitlines() if 4 <= len(l.strip()) <= 300][:60]
 
 
 def parse_json(t):
@@ -233,7 +262,7 @@ def mail_block(ms, banned, rm_phone, cap=2500):
     ) or "(none)"
 
 
-def day_prompt(site, stage, d, lines, mails, voice, n_img, o):
+def day_prompt(site, stage, d, lines, mails, voice, n_img, o, nemo="(none)", srcs=""):
     ban = f" Never use these words or phrases: {'; '.join(o['banned'])}." if o["banned"] else ""
     return "\n".join([
         "You write the daily site update for a telecom site delivery team, for management. Copy the style of the example: the site line, then one paragraph in past tense, plain professional English, factual. Add a short second paragraph only for notes, redlines, issues or pending items.",
@@ -246,21 +275,24 @@ def day_prompt(site, stage, d, lines, mails, voice, n_img, o):
         f"\nRULES: Describe the work done on {fmt(d)} as shown in the chat for that day, together with access, lock and unlock information, plans to return to site and next steps mentioned that day. Never mention work from other days. Keep technical specifics (equipment, bands, sectors, cells, counts, values) exactly as written in the chat and never drop them. Use only facts found in the chat messages, the related emails, the attached photos and the voice-note notes below. The chat is the main source for what happened on site that day. Use the emails for approvals, access, deliveries, instructions, issues, handover and other details, and add them only where they matter to management. Never copy email signatures, greetings, names or phone numbers. Do not invent facts, but DO interpret short or shorthand chat lines like a site delivery coordinator would, using the READING GUIDE: turn each into a full completed-work sentence (for example \"on site now\" means the team attended the site). Read the messages in order: a problem followed by a fix means it was resolved. Mention photo content only when it clearly shows completed work or a problem. Ignore greetings and chit-chat. Never include phone numbers or people’s names.{ban}",
         "\nCHAT MESSAGES:\n" + ("\n".join(lines) or "(none)"),
         "\nRELATED OUTLOOK EMAILS (background from the UK team or client, use them together with the chat):\n" + mails,
+        "\nNEMO DATA (from the Nemo system):\n" + nemo,
+        "\nSOURCES PROVIDED FOR THIS SITE: " + (srcs or "none") + ". Build the update from every source provided. Where two or more sources agree, state the fact plainly. Where they conflict (for example the chat says a task was completed but Nemo or an email shows it open), prefer the more cautious version in the paragraph and describe the conflict briefly in the \"differences\" field. If only one source is provided, build the update from that source alone. Never mention source names or the comparison in the paragraph, and never invent a source that is missing.",
         "\nVOICE-NOTE AND EXTRA NOTES (typed by the user):\n" + (voice or "(none)"),
         f"\nPHOTOS ATTACHED: {n_img}",
-        '\nReturn JSON only: {"paragraph":"text after the site line, with a blank line then the second paragraph if needed","status":"On-Air | Completed | In progress | Pending | Issue | No update","pending":"short text or Nil","issues":"short text or Nil"}',
+        '\nReturn JSON only: {"paragraph":"text after the site line, with a blank line then the second paragraph if needed","status":"On-Air | Completed | In progress | Pending | Issue | No update","pending":"short text or Nil","issues":"short text or Nil","differences":"short text or Nil"}',
     ])
 
 
-def pend_prompt(site, days_text, mails, d0, d1, o):
+def pend_prompt(site, days_text, mails, d0, d1, o, nemo="(none)"):
     ban = f" Never use these words or phrases: {'; '.join(o['banned'])}." if o["banned"] else ""
     return "\n".join([
         "You prepare a client-facing pending-items summary for a telecom site delivery team.",
         f"\nSITE: {site}\nDATES COVERED: {fmt(d0)} to {fmt(d1)}",
         "\nWHATSAPP CHAT PER DAY (oldest first):\n" + days_text,
         "\nRELATED OUTLOOK EMAILS:\n" + mails,
+        "\nNEMO DATA (from the Nemo system):\n" + nemo,
         "\nTASK: The site is worked on over several days. Go through the days in order from the first to the last. Find every task or item that was pending, blocked, awaited or left to complete on any day. Follow each pending item day by day until it is closed or the last day is reached: pending on day 1, check day 2, still pending on day 3, find out why it is still pending (the cause stated in the chat or emails). Mark each item Resolved (with the date it was closed) or Still pending. Then decide whether the site is closed: it is closed only when the chat or emails show the work is completed, handed over or closed out on the last day. Do not say that nothing is pending unless the chat confirms the closure; if the site is closed but an item has no closing information, list it as Still pending with the reason \"Closure not confirmed in the chat\".",
-        f"\nRULES: Use only facts in the chat and emails and invent nothing. Give the reason in your own words (for example waiting for a delivery, access, approval, weather or another team); if no reason is stated write \"Reason not stated in the chat\". Never include people’s names, phone numbers or internal remarks. Use a neutral, professional tone suitable for the client.{ban}",
+        f"\nRULES: Use only facts in the chat and emails and invent nothing. Give the reason in your own words (for example waiting for a delivery, access, approval, weather or another team); if no reason is stated write \"Reason not stated in the chat\". Never include people’s names, phone numbers or internal remarks. Use a neutral, professional tone suitable for the client. Use the chat, emails and Nemo data together (whichever are provided); where they conflict, treat the item as still pending unless one source clearly confirms it is closed, and never mention source names.{ban}",
         "\nREADING GUIDE (how short chat lines should be read):\n" + o["guide"],
         '\nReturn JSON only: {"items":[{"item":"...","firstRaised":"date","status":"Resolved or Still pending","resolvedOn":"date or empty","reason":"...","nextAction":"..."}],"siteClosed":true or false,"closedOn":"date or empty","summary":"3 to 5 sentence client-ready progress summary for this site that shows how pending items carried from day to day and how they were closed, or why they are still pending"}',
     ])
@@ -442,34 +474,66 @@ def main():
             include = st.text_area("Must appear if mentioned in the chat", INC, height=160)
     opts = dict(banned=banned, example=example, guide=guide, include=include, bullets=bullets, number=number)
 
-    # ---- uploads
-    st.subheader("1. Chats")
-    chat_files = st.file_uploader("WhatsApp exports (.zip with media, or .txt). One file per site group.", type=["zip", "txt"], accept_multiple_files=True)
-    st.caption("In WhatsApp: open the group → ⋮ → More → Export chat → Include media.")
-    mail_files = st.file_uploader("Related Outlook emails (optional, .eml or .txt)", type=["eml", "txt"], accept_multiple_files=True, key="mails")
-    pasted = st.text_area("Or paste email text (optional)", height=90)
+    # ---- sources
+    st.subheader("1. Sources")
+    st.caption("Add any one, two or all three. Upload files, paste text, or both. If only one source is available, the email is built from it alone.")
+    pname = st.text_input("Site name for pasted text (optional)", key="pname", placeholder="e.g. 99877 EE BT Widnes")
+    site_tag = pname.strip() or None
+    t1, t2, t3 = st.tabs(["WhatsApp chat", "Outlook email", "Nemo"])
+    with t1:
+        chat_files = st.file_uploader("WhatsApp exports (.zip with media, or .txt). One file per site group.", type=["zip", "txt"], accept_multiple_files=True)
+        st.caption("In WhatsApp: open the group → ⋮ → More → Export chat → Include media.")
+        pchat = st.text_area("Or paste the chat text", height=140, key="pchat")
+    with t2:
+        mail_files = st.file_uploader("Related Outlook emails (.eml or .txt)", type=["eml", "txt"], accept_multiple_files=True, key="mails")
+        pasted = st.text_area("Or paste email text", height=140, key="pmail")
+    with t3:
+        nemo_files = st.file_uploader("Nemo files (.txt, .csv, .xlsx)", type=["txt", "csv", "xlsx", "xls"], accept_multiple_files=True, key="nemo")
+        pnemo = st.text_area("Or paste Nemo data", height=140, key="pnemo")
 
-    mails = [parse_mail(f.getvalue(), f.name) for f in mail_files]
+    mails = []
+    for f in mail_files:
+        m = parse_mail(f.getvalue(), f.name)
+        m["fname"], m["site"] = f.name, None
+        mails.append(m)
     if pasted.strip():
-        mails.append(parse_mail(pasted.encode(), "Pasted email"))
+        m = parse_mail(pasted.encode(), "Pasted email")
+        m["fname"], m["site"] = "Pasted email", site_tag
+        mails.append(m)
+    nemo = [parse_nemo(f.getvalue(), f.name) for f in nemo_files]
+    if pnemo.strip():
+        nemo.append({"subject": "Pasted Nemo", "fname": "Pasted Nemo", "date": None, "text": pnemo.strip(), "site": site_tag})
 
     sites = []
     for f in chat_files:
         data = f.getvalue()
         txt = read_chat(data, f.name)
-        sites.append({"fn": f.name, "data": data, "is_zip": f.name.lower().endswith(".zip"), "txt": txt, "msgs": parse_chat(txt, dayfirst, cut)})
+        sites.append({"fn": f.name, "default": site_name(f.name), "data": data, "is_zip": f.name.lower().endswith(".zip"), "txt": txt, "msgs": parse_chat(txt, dayfirst, cut)})
+    if pchat.strip():
+        sites.append({"fn": "pasted:" + (site_tag or "chat"), "default": site_tag or "Pasted chat", "data": b"", "is_zip": False, "txt": pchat, "msgs": parse_chat(pchat, dayfirst, cut)})
+    known = {s["default"].lower() for s in sites}
+    for m in mails + nemo:  # sites that have only email or Nemo data (no chat)
+        if m.get("site"):
+            nm = m["site"]
+        elif not sites:
+            nm = "Pasted data" if m["fname"].startswith("Pasted") else site_name(m["fname"])
+        else:
+            continue
+        if nm.lower() not in known:
+            known.add(nm.lower())
+            sites.append({"fn": "virtual:" + nm, "default": nm, "data": b"", "is_zip": False, "txt": "", "msgs": []})
     if not sites:
-        st.info("Upload one or more chat exports to begin.")
+        st.info("Add at least one source (WhatsApp chat, Outlook email or Nemo) to begin.")
         return
-
-    all_days = sorted({m["d"] for s in sites for m in s["msgs"]})
-    if not all_days:
-        st.warning("No messages found. Check the date order setting in the sidebar.")
-        return
+    lone = len(sites) == 1
+    unused = [m["fname"] for m in mails + nemo if not any(mails_for(s["default"], [m], None, False, lone, s["default"]) for s in sites)]
+    if unused:
+        st.warning("Not matched to any site (site ID not found in them): " + ", ".join(unused) + ". Put the site name in “Site name for pasted text”, or make sure the site ID is inside the file.")
+    all_days = sorted({m["d"] for s in sites for m in s["msgs"]}) or sorted({m["date"] for m in mails if m["date"]})
 
     st.subheader("2. Dates")
     c1, c2 = st.columns(2)
-    d0 = c1.date_input("Report date", value=all_days[-1], key=f"d0_{len(sites)}")
+    d0 = c1.date_input("Report date", value=all_days[-1] if all_days else date.today(), key=f"d0_{len(sites)}")
     use_to = c2.checkbox("Also set a To date (one email per day)")
     d1 = c2.date_input("To date", value=d0, key=f"d1_{len(sites)}") if use_to else None
 
@@ -477,15 +541,15 @@ def main():
     sel = []
     for s in sites:
         imgs, auds, lines = day_data(s["msgs"], d0)
-        with st.expander(f"{site_name(s['fn'])}  ·  {len(lines)} messages · {len(imgs)} photos · {len(auds)} voice notes on {fmt(d0)}", expanded=True):
+        with st.expander(f"{s['default']}  ·  {len(lines)} messages · {len(imgs)} photos · {len(auds)} voice notes on {fmt(d0)}", expanded=True):
             a, b, c = st.columns([1, 3, 2])
             use = a.checkbox("Include", True, key="use_" + s["fn"])
-            s["name"] = b.text_input("Site line", site_name(s["fn"]), key="nm_" + s["fn"])
+            s["name"] = b.text_input("Site line", s["default"], key="nm_" + s["fn"])
             s["stage"] = c.text_input("Stage", detect_stage(s["txt"]), key="st_" + s["fn"])
             s["voice"] = st.text_area("Voice notes can’t be read automatically. Type what they said (optional).", key="vo_" + s["fn"], height=68)
             if imgs and not s["is_zip"]:
                 st.caption("Photos need a .zip export (Include media).")
-            st.caption(f"Emails matched: {len(mails_for(s['name'], mails))}")
+            st.caption(f"Sources for this site → WhatsApp: {'yes' if (lines or imgs) else 'no'} · Email: {len(mails_for(s['name'], mails, d0, same_day_mail, lone, s['default']))} · Nemo: {len(mails_for(s['name'], nemo, None, False, lone, s['default']))}")
             with st.expander("See chat lines used"):
                 st.text("\n".join(lines) or "(no messages on this date)")
         if use:
@@ -508,12 +572,19 @@ def main():
                 bar.progress(i / len(jobs), text=f"Working on {s['name']} · {fmt(d)} ({i + 1} of {len(jobs)})")
                 imgs, auds, lines = day_data(s["msgs"], d)
                 photos = load_photos(s["data"], imgs) if (s["is_zip"] and client) else []
+                em = mails_for(s["name"], mails, d, same_day_mail, lone, s["default"])
+                nm = mails_for(s["name"], nemo, None, False, lone, s["default"])
+                srcs = [x for x, ok in (("WhatsApp", bool(lines or imgs)), ("Email", bool(em)), ("Nemo", bool(nm))) if ok]
                 prompt = day_prompt(s["name"], s["stage"] if len(dts) == 1 else "", d, [clean(x, banned, rm_phone) for x in lines],
-                                    mail_block(mails_for(s["name"], mails, d, same_day_mail), banned, rm_phone), clean(s["voice"], banned, rm_phone), len(photos), opts)
+                                    mail_block(em, banned, rm_phone), clean(s["voice"], banned, rm_phone), len(photos), opts,
+                                    nemo_block(nm, banned, False), " + ".join(srcs))
                 try:
-                    r = ask(client, model, prompt, photos) if client else basic_day([clean(x, banned, rm_phone) for x in lines], opts)
+                    r = ask(client, model, prompt, photos) if client else basic_day([clean(x, banned, rm_phone) for x in lines] + nemo_lines(nm), opts)
                 except Exception as e:  # keep going with the other sites
                     r = {"paragraph": f"[Could not create this site: {e}]", "status": "Error", "pending": "", "issues": ""}
+                r["_src"] = " + ".join(srcs) or "None"
+                if not client:
+                    r.setdefault("differences", "Needs the AI key to compare" if len(srcs) > 1 else "Nil")
                 res.setdefault(d, []).append((s, r))
             bar.empty()
             days = []
@@ -524,7 +595,7 @@ def main():
                     stage = f" {s['stage']}" if s["stage"] and len(dts) == 1 else ""
                     parts.append(f"{pre}{s['name']}{stage} : {clean(r.get('paragraph', ''), banned, rm_phone)}")
                 body = (greet + "\n\n" if greet else "") + (f"Date: {fmt(d)}\n\n" if show_date else "") + "\n\n".join(parts) + ("\n\n" + sign if sign else "")
-                table = [{"Site": s["name"], "Status": r.get("status", ""), "Pending": clean(str(r.get("pending", "Nil")), banned, rm_phone), "Issues / Errors": clean(str(r.get("issues", "Nil")), banned, rm_phone)} for s, r in rows]
+                table = [{"Site": s["name"], "Sources": r.get("_src", ""), "Status": r.get("status", ""), "Pending": clean(str(r.get("pending", "Nil")), banned, rm_phone), "Issues / Errors": clean(str(r.get("issues", "Nil")), banned, rm_phone), "Differences": clean(str(r.get("differences", "Nil")), banned, rm_phone)} for s, r in rows]
                 days.append({"d": d, "body": body, "table": table})
             st.session_state["out"] = {"kind": "daily", "days": days, "multi": len(dts) > 1, "n": st.session_state.get("n", 0) + 1}
             st.session_state["n"] = st.session_state["out"]["n"]
@@ -539,7 +610,8 @@ def main():
                 continue
             cap = 60000 // len(days)
             days_text = "\n\n".join(f"{fmt(d)}:\n" + ("\n".join(clean(x, banned, rm_phone) for x in day_data(s["msgs"], d)[2])[:cap] or "(no messages)") for d in days)
-            prompt = pend_prompt(s["name"], days_text, mail_block(mails_for(s["name"], mails, None, False), banned, rm_phone, 2000), days[0], days[-1], opts)
+            prompt = pend_prompt(s["name"], days_text, mail_block(mails_for(s["name"], mails, None, False, lone, s["default"]), banned, rm_phone, 2000), days[0], days[-1], opts,
+                               nemo_block(mails_for(s["name"], nemo, None, False, lone, s["default"]), banned, False, 4000))
             try:
                 r = ask(client, model, prompt, None, 4000) if client else basic_pend(s["msgs"], days)
             except Exception as e:
