@@ -220,6 +220,22 @@ def mails_for(name, entries, d=None, same_day=True, lone=False, alt=""):
     return out[:5]
 
 
+def _norm(x):
+    return re.sub(r"[^a-z0-9]", "", x.lower())
+
+
+def match_site(tag, sites):
+    """Find the existing site that a typed site name refers to (same ID digits, or one name contains the other)."""
+    nt, nums = _norm(tag), set(re.findall(r"\d{4,}", tag))
+    for s in sites:
+        nd = _norm(s["default"])
+        if nt and nd and (nt in nd or nd in nt):
+            return s
+        if nums & set(re.findall(r"\d{4,}", s["default"])):
+            return s
+    return None
+
+
 def parse_nemo(data: bytes, name: str):
     low = name.lower()
     try:
@@ -477,7 +493,7 @@ def main():
     # ---- sources
     st.subheader("1. Sources")
     st.caption("Add any one, two or all three. Upload files, paste text, or both. If only one source is available, the email is built from it alone.")
-    pname = st.text_input("Site name for pasted text (optional)", key="pname", placeholder="e.g. 99877 EE BT Widnes")
+    pname = st.text_input("Site name for pasted text (optional)", key="pname", placeholder="e.g. 99877 EE BT Widnes", help="Used to attach pasted email, Nemo or chat text to the right site. If it matches a chat you uploaded, they are combined into one email.")
     site_tag = pname.strip() or None
     t1, t2, t3 = st.tabs(["WhatsApp chat", "Outlook email", "Nemo"])
     with t1:
@@ -511,6 +527,14 @@ def main():
         sites.append({"fn": f.name, "default": site_name(f.name), "data": data, "is_zip": f.name.lower().endswith(".zip"), "txt": txt, "msgs": parse_chat(txt, dayfirst, cut)})
     if pchat.strip():
         sites.append({"fn": "pasted:" + (site_tag or "chat"), "default": site_tag or "Pasted chat", "data": b"", "is_zip": False, "txt": pchat, "msgs": parse_chat(pchat, dayfirst, cut)})
+    chat_sites = list(sites)
+    for m in mails + nemo:  # a typed site name must join its own chat site, not create a second site
+        if m.get("site"):
+            hit = match_site(m["site"], chat_sites)
+            if hit:
+                m["site"] = hit["default"]
+            elif len(chat_sites) == 1:
+                m["site"] = chat_sites[0]["default"]
     known = {s["default"].lower() for s in sites}
     for m in mails + nemo:  # sites that have only email or Nemo data (no chat)
         if m.get("site"):
@@ -557,6 +581,7 @@ def main():
 
     st.subheader("4. Create")
     b1, b2 = st.columns(2)
+    st.caption(f"One email will be created. It has one paragraph for each of the {len(sel)} site(s) selected above, and each paragraph combines that site’s WhatsApp, email and Nemo data.")
     go = b1.button("Create email", type="primary", disabled=not sel)
     gp = b2.button("Client summary (whole site)", disabled=not sel)
 
