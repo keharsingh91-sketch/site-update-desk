@@ -316,11 +316,51 @@ def pend_prompt(site, days_text, mails, d0, d1, o, nemo="(none)"):
 
 
 # ---------------------------------------------------------------- basic mode (no AI key)
-ISSUE_RE = re.compile(r"\b(issues?|errors?|fail(ed|ure|s)?|faults?|faulty|shortages?|delay(ed)?|blocked|not working|rejected|denied|no access|missing|damaged|wrong|mismatch|rolled? ?back|escalat\w+|unable|cannot|can.?t)\b", re.I)
+ISSUE_RE = re.compile(r"\b(outages?|issues?|errors?|fail(ed|ure|s)?|faults?|faulty|shortages?|delay(ed)?|blocked|not working|rejected|denied|no access|missing|damaged|wrong|mismatch|rolled? ?back|escalat\w+|unable|cannot|can.?t)\b", re.I)
 NEG_RE = re.compile(r"\b(no|nil|zero|without|resolved|cleared|fixed)\b.{0,20}\b(issues?|errors?|fail\w*|faults?|alarms?|shortages?|delay\w*)", re.I)
 PEND_RE = re.compile(r"\b(pending|awaiting|await(ed)?|waiting|to be (done|completed|shared|raised|checked)|tomorrow|yet to|required|needs?|needed|follow.?up|reschedul\w+|on hold|will be|returning)\b", re.I)
 NOISE_RE = re.compile(r"^(ok(ay)?|thanks?( you)?|noted|ack|received|done)\W*$", re.I)
 
+
+
+ACR = {"ct": "CT", "cts": "CTs", "pc": "PC", "ai": "AI", "pi": "PI", "ohs": "OHS", "vswr": "VSWR", "ran": "RAN", "gps": "GPS", "ers": "ERS", "airi": "AIRI",
+       "bbu": "BBU", "bbus": "BBUs", "erf": "ERF", "pow": "POW", "fe": "FE", "rf": "RF", "psu": "PSU", "dcdu": "DCDU", "mewp": "MEWP", "gl": "GL", "fl": "FL",
+       "ctil": "CTIL", "dici": "DICI", "vmo2": "VMO2", "ee": "EE", "bt": "BT"}
+SLANG = [(r"\btmrw\b|\btmr\b|\btomorow\b", "tomorrow"), (r"\s*\b(pls|plz)\b", ""), (r"\bw/o\b", "without"), (r"\bw/", "with "), (r"\s&\s", " and "), (r"\basap\b", "as soon as possible")]
+GREET = re.compile(r"^(good\s+)?(morning|afternoon|evening|hi|hello|hey)(\s+(all|team|everyone|guys))?\W*$", re.I)
+ARRIVE = re.compile(r"\b(on site|onsite|at site|arrived|reached)\b", re.I)
+PART = {"done": "completed", "complete": "completed", "finished": "completed"}
+DONE_VERBS = "completed|complete|done|finished|installed|commissioned|cleared|resolved|delivered|swapped out|replaced|tested|shared|checked|decommed|connected|fitted|removed|closed|raised"
+
+
+def polish(sentence):
+    """Basic mode: turn short chat shorthand into a full, past-tense report sentence. Returns '' for greetings."""
+    t = sentence.strip().strip("-•* ").strip()
+    if not t or GREET.match(t):
+        return ""
+    for pat, rp in SLANG:
+        t = re.sub(pat, rp, t, flags=re.I)
+    t = re.sub(r"\b(\w+)['’]s(?=\s+(?:completed|complete|done|installed|cleared)\b)", r"\1s", t)
+    t = re.sub(r"\b[A-Za-z0-9]+\b", lambda m: ACR.get(m.group(0).lower(), m.group(0)), t)
+    if len(t.split()) <= 8 and ARRIVE.search(t) and not re.search(rf"\b(left|leaving|off site|not|{DONE_VERBS})\b", t, re.I):
+        return "The team attended the site."
+    pairs = list(re.finditer(r"\b([A-Za-z][\w/'’]{0,12})\s+(?:completed|complete|done|finished)\b", t))
+    if len(pairs) >= 2 and pairs[0].start() == 0:
+        names = [m.group(1) for m in pairs]
+        rest = t[pairs[-1].end():].strip(" .,")
+        return ", ".join(names[:-1]) + " and " + names[-1] + " were completed" + (f" {rest}" if rest else "") + "."
+    m = re.match(rf"^(?P<subj>[^.]{{2,60}}?)\s+(?P<v>{DONE_VERBS})\W*$", t, re.I)
+    if m and not re.search(r"\b(was|were|is|are|has|have|had|been)\b", m.group("subj"), re.I) and len(m.group("subj").split()) <= 7:
+        subj, v = m.group("subj").strip(), PART.get(m.group("v").lower(), m.group("v").lower())
+        plural = subj.lower().endswith("s") and not subj.lower().endswith("ss")
+        return f"{subj[0].upper() + subj[1:]} {'were' if plural else 'was'} {v}."
+    t = re.sub(r"\b(is|are)\s+(cleared|completed|installed|resolved|done|complete|finished|delivered|commissioned)\b",
+               lambda x: ("was" if x.group(1).lower() == "is" else "were") + " " + PART.get(x.group(2).lower(), x.group(2).lower()), t, flags=re.I)
+    m = re.match(r"^((?:\w+\s+){0,2}(outages?|alarms?|faults?|issues?)(?:\s+(?:on|at|in|with)\s+[\w /-]{1,30})?)\W*$", t, re.I)
+    if m:
+        subj = m.group(1).strip()
+        return f"{subj[0].upper() + subj[1:]} {'were' if m.group(2).lower().endswith('s') else 'was'} reported."
+    return t[0].upper() + t[1:]
 
 def classify(lines):
     done, pend, iss = [], [], []
@@ -329,12 +369,18 @@ def classify(lines):
             s = s.strip()
             if len(s) < 4 or NOISE_RE.match(s):
                 continue
-            s = s[0].upper() + s[1:]
+            s = polish(s)
+            if not s:
+                continue
             s = s if re.search(r"[.!?]$", s) else s + "."
             bad = ISSUE_RE.search(s) and not NEG_RE.search(s)
             target = iss if bad else pend if PEND_RE.search(s) else done
             if s not in target:
                 target.append(s)
+    arrive = "The team attended the site."
+    if arrive in done:
+        done.remove(arrive)
+        done.insert(0, arrive)
     return done, pend, iss
 
 
@@ -466,7 +512,7 @@ def main():
     api_key = secret("ANTHROPIC_API_KEY")
     client = Anthropic(api_key=api_key) if api_key else None
     if not client:
-        st.caption("Basic mode (no AI key): chats are sorted with keywords and written as they appear. Photos, emails and smart rewriting are switched off. Add ANTHROPIC_API_KEY in the app secrets to turn them on.")
+        st.caption("Basic mode (no AI key): chats are sorted with keywords and common shorthand is rewritten with simple rules. Photos, emails, comparing sources and full email-style writing need the AI key. Add ANTHROPIC_API_KEY in the app secrets to turn them on.")
     model = secret("MODEL", "claude-sonnet-5-5")
 
     # ---- sidebar settings
